@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2013-2022 The SRS Authors
+// Copyright (c) 2013-2023 The SRS Authors
 //
 // SPDX-License-Identifier: MIT or MulanPSL-2.0
 //
@@ -14,7 +14,7 @@ using namespace std;
 #include <srs_kernel_buffer.hpp>
 #include <srs_kernel_stream.hpp>
 #include <srs_core_autofree.hpp>
-#include <srs_protocol_raw_hevc.hpp>
+//#include <srs_protocol_raw_hevc.hpp>
 #include <srs_protocol_raw_avc.hpp>
 #include <srs_protocol_rtmp_stack.hpp>
 #include <srs_app_source.hpp>
@@ -236,15 +236,7 @@ void SrsSrtConsumer::wait(int nb_msgs, srs_utime_t timeout)
     srs_cond_timedwait(mw_wait, timeout);
 }
 
-ISrsSrtSourceBridge::ISrsSrtSourceBridge()
-{
-}
-
-ISrsSrtSourceBridge::~ISrsSrtSourceBridge()
-{
-}
-
-SrsRtmpFromSrtBridge::SrsRtmpFromSrtBridge(SrsLiveSource* source) : ISrsSrtSourceBridge()
+SrsSrtFrameBuilder::SrsSrtFrameBuilder(ISrsStreamBridge* bridge)
 {
     ts_ctx_ = new SrsTsContext();
 
@@ -254,7 +246,7 @@ SrsRtmpFromSrtBridge::SrsRtmpFromSrtBridge(SrsLiveSource* source) : ISrsSrtSourc
     pps_ = "";
 
     req_ = NULL;
-    live_source_ = source;
+    bridge_ = bridge;
 
     video_streamid_ = 1;
     audio_streamid_ = 2;
@@ -264,7 +256,7 @@ SrsRtmpFromSrtBridge::SrsRtmpFromSrtBridge(SrsLiveSource* source) : ISrsSrtSourc
     pp_audio_duration_ = new SrsAlonePithyPrint();
 }
 
-SrsRtmpFromSrtBridge::~SrsRtmpFromSrtBridge()
+SrsSrtFrameBuilder::~SrsSrtFrameBuilder()
 {
     srs_freep(ts_ctx_);
     srs_freep(req_);
@@ -272,18 +264,12 @@ SrsRtmpFromSrtBridge::~SrsRtmpFromSrtBridge()
     srs_freep(pp_audio_duration_);
 }
 
-srs_error_t SrsRtmpFromSrtBridge::on_publish()
+srs_error_t SrsSrtFrameBuilder::on_publish()
 {
-    srs_error_t err = srs_success;
-
-    if ((err = live_source_->on_publish()) != srs_success) {
-        return srs_error_wrap(err, "on publish");
+    return srs_success;
     }
 
-    return err;
-}
-
-srs_error_t SrsRtmpFromSrtBridge::on_packet(SrsSrtPacket *pkt)
+srs_error_t SrsSrtFrameBuilder::on_packet(SrsSrtPacket *pkt)
 {
     srs_error_t err = srs_success;
 
@@ -310,12 +296,12 @@ srs_error_t SrsRtmpFromSrtBridge::on_packet(SrsSrtPacket *pkt)
     return err;
 }
 
-void SrsRtmpFromSrtBridge::on_unpublish()
+void SrsSrtFrameBuilder::on_unpublish()
 {
     live_source_->on_unpublish();
 }
 
-srs_error_t SrsRtmpFromSrtBridge::initialize(SrsRequest* req)
+srs_error_t SrsSrtFrameBuilder::initialize(SrsRequest* req)
 {
     srs_error_t err = srs_success;
 
@@ -325,7 +311,7 @@ srs_error_t SrsRtmpFromSrtBridge::initialize(SrsRequest* req)
     return err;
 }
 
-srs_error_t SrsRtmpFromSrtBridge::on_ts_message(SrsTsMessage* msg)
+srs_error_t SrsSrtFrameBuilder::on_ts_message(SrsTsMessage* msg)
 {
     srs_error_t err = srs_success;
     
@@ -351,12 +337,12 @@ srs_error_t SrsRtmpFromSrtBridge::on_ts_message(SrsTsMessage* msg)
     
     // publish audio or video.
     if (msg->channel->stream == SrsTsStreamVideoH264) {
-        if ((err = on_ts_avc_video(msg, &avs)) != srs_success) {
+        if ((err = on_ts_video_avc(msg, &avs)) != srs_success) {
             return srs_error_wrap(err, "ts: consume video");
         }
     }
     if (msg->channel->stream == SrsTsStreamVideoHEVC) {
-        if ((err = on_ts_hevc_video(msg, &avs)) != srs_success) {
+        if ((err = on_ts_video_hevc(msg, &avs)) != srs_success) {
             return srs_error_wrap(err, "ts: consume video h265");
         }
     }
@@ -370,166 +356,12 @@ srs_error_t SrsRtmpFromSrtBridge::on_ts_message(SrsTsMessage* msg)
     return err;
 }
 
-srs_error_t SrsRtmpFromSrtBridge::on_ts_hevc_video(SrsTsMessage* msg, SrsBuffer* avs)
+
+srs_error_t SrsSrtFrameBuilder::on_ts_video_avc(SrsTsMessage* msg, SrsBuffer* avs)
 {
     srs_error_t err = srs_success;
 
-    vector<pair<char*, int> > ipb_frames[32];
-
-    SrsRawHEVCStream* hevc = new SrsRawHEVCStream();
-    SrsAutoFree(SrsRawHEVCStream, hevc);
-
-	int i_frame = 0;
-	int b_data = 0;
-
-    while (!avs->empty()) {
-        char* frame = NULL;
-        int frame_size = 0;
-        if ((err = hevc->annexb_demux(avs, &frame, &frame_size)) != srs_success) {
-            return srs_error_wrap(err, "demux annexb");
-        }
-
-		if (frame_size <= 0 ) {
-            continue;
-        }
-        
-        SrsHevcNaluType nal_unit_type = SrsHevcNaluTypeParse(frame[0]);
-
-		//printf("%d size:%5d\n", nal_unit_type, frame_size);
-
-        if (nal_unit_type == SrsHevcNaluType_ACCESS_UNIT_DELIMITER) {
-			if(i_frame < 15)
-			i_frame += b_data;
-			b_data = 0;
-            continue;
-        }
-        if (nal_unit_type == SrsHevcNaluType_SEI) {
-            continue;
-        }
-
-        if (hevc->is_vps(frame, frame_size)) {
-            std::string vps;
-            if ((err = hevc->vps_demux(frame, frame_size, vps)) != srs_success) {
-                return srs_error_wrap(err, "hevc demux vps");
-            }
-            if (h265_vps_ == vps) {
-                continue;
-            }
-            h265_vps_ = vps;
-            h265_sps_pps_change_ = true;
-            continue;
-        }
-
-        if (hevc->is_sps(frame, frame_size)) {
-            std::string sps;
-            if ((err = hevc->sps_demux(frame, frame_size, sps)) != srs_success) {
-                return srs_error_wrap(err, "demux sps");
-            }
-            if (h265_sps_ == sps) {
-                continue;
-            }
-            h265_sps_ = sps;
-            h265_sps_pps_change_ = true;
-            continue;
-        }
-
-        if (hevc->is_pps(frame, frame_size)) {
-            std::string pps;
-            if ((err = hevc->pps_demux(frame, frame_size, pps)) != srs_success) {
-                return srs_error_wrap(err, "demux pps");
-            }
-            if (h265_pps_ == pps) {
-                continue;
-            }
-            h265_pps_ = pps;
-            h265_sps_pps_change_ = true;
-            continue;
-        }
-
-		b_data = 1;
-        ipb_frames[i_frame].push_back(make_pair(frame, frame_size));
-    }
-
-    if ((err = check_h265_sps_pps_change(msg)) != srs_success) {
-        return srs_error_wrap(err, "check h265 sps pps");
-    }
-
-	int b = 0;
-	int i_bframe = 0;
-	i_frame += b_data;
-	for(int i = 0; i < i_frame; i++)
-	{
-		if(!i)
-		{
-			i_dts = msg->dts*100 / 9;
-			i_pts = msg->pts*100 / 9;
-			if(msg->pts != msg->dts)
-			{
-				if(i_last_dts > 0)
-				{
-					i_frame_period = i_dts - i_last_dts;
-					if(i_frame_period < 10000)
-					i_frame_period = 10000;
-					i_last_dts = 0;
-				}
-
-				i_bframe = (i_pts - i_dts + i_frame_period/2)/i_frame_period;
-				if(i_bframe > 2)
-					i_bframe = 2;
-				else if(i_bframe < 0)
-					i_bframe = 0;
-			}
-			else
-			{
-				i_last_dts = i_dts;
-			}
-		}
-		else
-		{
-			if(i_bframe == b)
-			{
-				i_dts += i_frame_period;
-				if(i_bframe > 0)
-					i_pts = i_dts + i_frame_period*i_bframe;
-				else
-					i_pts = i_dts;
-				b = 0;
-			}
-			else
-			{
-				i_pts  = i_dts;
-				i_dts += i_frame_period;
-				b++;
-			}
-		}
-
-#if 0
-		{
-			static int64_t dts = 0;
-			FILE *fp = fopen("/home/gmt/Documents/test.txt", dts > 0? "at":"wt");
-			fprintf(fp, "i:%d b:%d pd:%d dts:%ld d:%ld pts:%ld pts-dts:%ld\n",
-				i, b, i_frame_period, i_dts, i_dts - dts, i_pts, i_pts - i_dts);
-			fclose(fp);
-			dts = i_dts;
-		}
-#endif
-
-		msg->dts = i_dts*9/100;
-		msg->pts = i_pts*9/100;
-
-		if ((err = on_video_frame(msg, ipb_frames[i], SrsVideoCodecIdHEVC)) != srs_success) {
-			return srs_error_wrap(err, "on_video_frame");
-		}
-	}
-
-    return err;//on_video_frame(msg, ipb_frames, SrsVideoCodecIdHEVC);
-}
-
-srs_error_t SrsRtmpFromSrtBridge::on_ts_avc_video(SrsTsMessage* msg, SrsBuffer* avs)
-{
-    srs_error_t err = srs_success;
-
-    vector<pair<char*, int> > ipb_frames[32];
+    vector<pair<char*, int> > ipb_frames;
 
     SrsRawH264Stream* avc = new SrsRawH264Stream();
     SrsAutoFree(SrsRawH264Stream, avc);
@@ -545,7 +377,7 @@ srs_error_t SrsRtmpFromSrtBridge::on_ts_avc_video(SrsTsMessage* msg, SrsBuffer* 
             return srs_error_wrap(err, "demux annexb");
         }
         
-		if (frame_size <= 0 ) {
+		if (frame == NULL || frame_size <= 0 ) {
             continue;
         }
 
@@ -590,7 +422,7 @@ srs_error_t SrsRtmpFromSrtBridge::on_ts_avc_video(SrsTsMessage* msg, SrsBuffer* 
         ipb_frames[i_frame].push_back(make_pair(frame, frame_size));
     }
 
-    if ((err = check_h264_sps_pps_change(msg)) != srs_success) {
+    if ((err = check_sps_pps_change(msg)) != srs_success) {
         return srs_error_wrap(err, "check sps pps");
     }
 
@@ -658,7 +490,7 @@ srs_error_t SrsRtmpFromSrtBridge::on_ts_avc_video(SrsTsMessage* msg, SrsBuffer* 
 		msg->dts = i_dts*9/100;
 		msg->pts = i_pts*9/100;
 
-		if ((err = on_video_frame(msg, ipb_frames[i], SrsVideoCodecIdAVC)) != srs_success) {
+		if ((err = on_h264_frame(msg, ipb_frames[i], SrsVideoCodecIdAVC)) != srs_success) {
 			return srs_error_wrap(err, "on_video_frame");
 		}
 	}
@@ -666,220 +498,13 @@ srs_error_t SrsRtmpFromSrtBridge::on_ts_avc_video(SrsTsMessage* msg, SrsBuffer* 
     return err;//on_video_frame(msg, ipb_frames, SrsVideoCodecIdAVC);
 }
 
-srs_error_t SrsRtmpFromSrtBridge::check_h265_sps_pps_change(SrsTsMessage* msg)
-{
-    srs_error_t err = srs_success;
-
-    if (!h265_sps_pps_change_) {
-        return err;
-    }
-
-    // sps/pps changed, generate new video sh frame and dispatch it.
-    h265_sps_pps_change_ = false;
-    // ts tbn to flv tbn.
-    uint32_t dts = (uint32_t)(msg->dts / 90);
-
-    std::string sh;
-    SrsRawHEVCStream* hevc = new SrsRawHEVCStream();
-    SrsAutoFree(SrsRawHEVCStream, hevc);
-
-    err = hevc->mux_sequence_header(h265_sps_, h265_pps_, h265_vps_, dts, dts, sh);
-    if (err != srs_success) {
-        return srs_error_wrap(err, "mux sequence header");
-    }
-
-	// hevc packet to flv packet.
-	int8_t frame_type = SrsVideoAvcFrameTypeKeyFrame;
-	int8_t avc_packet_type = SrsVideoAvcFrameTraitSequenceHeader;
-	char* flv = NULL;
-	int nb_flv = 0;
-	if ((err = hevc->mux_avc2flv(sh, frame_type, avc_packet_type, dts, dts, &flv, &nb_flv)) != srs_success) {
-		return srs_error_wrap(err, "avc to flv");
-	}
-
-    SrsMessageHeader header;
-    header.initialize_video(nb_flv, dts, video_streamid_);
-    SrsCommonMessage rtmp;
-    if ((err = rtmp.create(&header, flv, nb_flv)) != srs_success) {
-        return srs_error_wrap(err, "create rtmp");
-    }
-
-    if ((err = live_source_->on_video(&rtmp)) != srs_success) {
-        return srs_error_wrap(err, "srt to rtmp sps/pps");
-    }
-
-    return err;
-}
-
-srs_error_t SrsRtmpFromSrtBridge::check_h264_sps_pps_change(SrsTsMessage* msg)
+srs_error_t SrsSrtFrameBuilder::check_sps_pps_change(SrsTsMessage* msg)
 {
     srs_error_t err = srs_success;
 
     if (! sps_pps_change_) {
-        return err;
-    }
-
-    // sps/pps changed, generate new video sh frame and dispatch it.
-    sps_pps_change_ = false;
-
-    // ts tbn to flv tbn.
-    uint32_t dts = (uint32_t)(msg->dts / 90);
-
-    std::string sh;
-    SrsRawH264Stream* avc = new SrsRawH264Stream();
-    SrsAutoFree(SrsRawH264Stream, avc);
-
-    if ((err = avc->mux_sequence_header(sps_, pps_, sh)) != srs_success) {
-        return srs_error_wrap(err, "mux sequence header");
-    }
-
-    // h264 packet to flv packet.
-    char* flv = NULL;
-    int nb_flv = 0;
-    if ((err = avc->mux_avc2flv(sh, SrsVideoAvcFrameTypeKeyFrame, SrsVideoAvcFrameTraitSequenceHeader, dts, dts, &flv, &nb_flv)) != srs_success) {
-        return srs_error_wrap(err, "avc to flv");
-    }
-
-    SrsMessageHeader header;
-    header.initialize_video(nb_flv, dts, video_streamid_);
-    SrsCommonMessage rtmp;
-    if ((err = rtmp.create(&header, flv, nb_flv)) != srs_success) {
-        return srs_error_wrap(err, "create rtmp");
-    }
-
-    if ((err = live_source_->on_video(&rtmp)) != srs_success) {
-        return srs_error_wrap(err, "srt to rtmp sps/pps");
-    }
-
     return err;
 }
-srs_error_t SrsRtmpFromSrtBridge::on_video_frame(SrsTsMessage* msg,
-                                            vector<pair<char*, int> >& ipb_frames,
-                                            enum SrsVideoCodecId codecId)
-{
-    srs_error_t err = srs_success;
-
-    if (ipb_frames.empty()) {
-        return srs_error_new(ERROR_SRT_CONN, "empty frame");
-    }
-
-    bool is_keyframe = false;
-
-    // ts tbn to flv tbn.
-    uint32_t dts = (uint32_t)(msg->dts / 90);
-    uint32_t pts = (uint32_t)(msg->pts / 90);
-    int32_t cts = pts - dts;
-
-    int frame_size = 5; // 5bytes video tag header
-    for (size_t i = 0; i != ipb_frames.size(); ++i) {
-        // 4 bytes for nalu length.
-        frame_size += 4 + ipb_frames[i].second;
-        if (((SrsAvcNaluType)(ipb_frames[i].first[0] & 0x1f)) == SrsAvcNaluTypeIDR) {
-            is_keyframe = true;
-        }
-    }
-
-    SrsCommonMessage rtmp;
-    rtmp.header.initialize_video(frame_size, dts, video_streamid_);
-    rtmp.create_payload(frame_size);
-    rtmp.size = frame_size;
-    SrsBuffer payload(rtmp.payload, rtmp.size);
-    // Write 5bytes video tag header.
-    if (is_keyframe) {
-        payload.write_1bytes(0x10 | codecId); // type(4 bits): key frame; code(4bits): avc
-    } else {
-        payload.write_1bytes(0x20 | codecId); // type(4 bits): inter frame; code(4bits): avc
-    }
-    payload.write_1bytes(0x01); // avc_type: nalu
-    payload.write_3bytes(cts);  // composition time
-
-    // Write video nalus.
-    for (size_t i = 0; i != ipb_frames.size(); ++i) {
-        char* nal = ipb_frames[i].first;
-        int nal_size = ipb_frames[i].second;
-
-        // write 4 bytes of nalu length.
-        payload.write_4bytes(nal_size);
-        // write nalu
-        payload.write_bytes(nal, nal_size);
-    }
-
-    if ((err = live_source_->on_video(&rtmp)) != srs_success) {
-        return srs_error_wrap(err ,"srt ts video to rtmp");
-    }
-
-    return err;
-}
-
-/*
-srs_error_t SrsRtmpFromSrtBridge::on_ts_video(SrsTsMessage* msg, SrsBuffer* avs)
-{
-    srs_error_t err = srs_success;
-
-    vector<pair<char*, int> > ipb_frames;
-
-    SrsRawH264Stream* avc = new SrsRawH264Stream();
-    SrsAutoFree(SrsRawH264Stream, avc);
-    
-    // send each frame.
-    while (!avs->empty()) {
-        char* frame = NULL;
-        int frame_size = 0;
-        if ((err = avc->annexb_demux(avs, &frame, &frame_size)) != srs_success) {
-            return srs_error_wrap(err, "demux annexb");
-        }
-
-        if (frame == NULL || frame_size == 0) {
-            continue;
-        }
-        
-        // for sps
-        if (avc->is_sps(frame, frame_size)) {
-            std::string sps;
-            if ((err = avc->sps_demux(frame, frame_size, sps)) != srs_success) {
-                return srs_error_wrap(err, "demux sps");
-            }
-            
-            if (! sps.empty() && sps_ != sps) {
-                sps_pps_change_ = true;
-            }
-
-            sps_ = sps;
-            continue;
-        }
-        
-        // for pps
-        if (avc->is_pps(frame, frame_size)) {
-            std::string pps;
-            if ((err = avc->pps_demux(frame, frame_size, pps)) != srs_success) {
-                return srs_error_wrap(err, "demux pps");
-            }
-            
-            if (! pps.empty() && pps_ != pps) {
-                sps_pps_change_ = true;
-            }
-
-            pps_ = pps;
-            continue;
-        }
-
-        ipb_frames.push_back(make_pair(frame, frame_size));
-    }
-
-    if ((err = check_sps_pps_change(msg)) != srs_success) {
-        return srs_error_wrap(err, "check sps pps");
-    }
-
-    return on_h264_frame(msg, ipb_frames);
-}
-
-srs_error_t SrsRtmpFromSrtBridge::check_sps_pps_change(SrsTsMessage* msg)
-{
-    srs_error_t err = srs_success;
-
-    if (! sps_pps_change_) {
-        return err;
-    }
 
     if (sps_.empty() || pps_.empty()) {
         return srs_error_new(ERROR_SRT_TO_RTMP_EMPTY_SPS_PPS, "sps or pps empty");
@@ -913,14 +538,19 @@ srs_error_t SrsRtmpFromSrtBridge::check_sps_pps_change(SrsTsMessage* msg)
         return srs_error_wrap(err, "create rtmp");
     }
 
-    if ((err = live_source_->on_video(&rtmp)) != srs_success) {
+    SrsSharedPtrMessage frame;
+    if ((err = frame.create(&rtmp)) != srs_success) {
+        return srs_error_wrap(err, "create frame");
+    }
+
+    if ((err = bridge_->on_frame(&frame)) != srs_success) {
         return srs_error_wrap(err, "srt to rtmp sps/pps");
     }
 
     return err;
 }
 
-srs_error_t SrsRtmpFromSrtBridge::on_h264_frame(SrsTsMessage* msg, vector<pair<char*, int> >& ipb_frames)
+srs_error_t SrsSrtFrameBuilder::on_h264_frame(SrsTsMessage* msg, vector<pair<char*, int> >& ipb_frames)
 {
     srs_error_t err = srs_success;
 
@@ -951,9 +581,9 @@ srs_error_t SrsRtmpFromSrtBridge::on_h264_frame(SrsTsMessage* msg, vector<pair<c
     SrsBuffer payload(rtmp.payload, rtmp.size);
     // Write 5bytes video tag header.
     if (is_keyframe) {
-        payload.write_1bytes(0x17); // type(4 bits): key frame; code(4bits): avc
+        payload.write_1bytes(0x17 | codecId); // type(4 bits): key frame; code(4bits): avc
     } else {
-        payload.write_1bytes(0x27); // type(4 bits): inter frame; code(4bits): avc
+        payload.write_1bytes(0x27 | codecId); // type(4 bits): inter frame; code(4bits): avc
     }
     payload.write_1bytes(0x01); // avc_type: nalu
     payload.write_3bytes(cts);  // composition time
@@ -969,14 +599,305 @@ srs_error_t SrsRtmpFromSrtBridge::on_h264_frame(SrsTsMessage* msg, vector<pair<c
         payload.write_bytes(nal, nal_size);
     }
 
-    if ((err = live_source_->on_video(&rtmp)) != srs_success) {
+    SrsSharedPtrMessage frame;
+    if ((err = frame.create(&rtmp)) != srs_success) {
+        return srs_error_wrap(err, "create frame");
+    }
+
+    if ((err = bridge_->on_frame(&frame)) != srs_success) {
         return srs_error_wrap(err ,"srt ts video to rtmp");
     }
 
     return err;
 }
+
+
+srs_error_t SrsSrtFrameBuilder::on_ts_video_hevc(SrsTsMessage *msg, SrsBuffer *avs)
+{
+    srs_error_t err = srs_success;
+
+    vector<pair<char*, int> > ipb_frames;
+
+    SrsRawHEVCStream *hevc = new SrsRawHEVCStream();
+    SrsAutoFree(SrsRawHEVCStream, hevc);
+
+	// send each frame.
+    int i_frame = 0;
+	int b_data = 0;
+
+    while (!avs->empty()) {
+        char* frame = NULL;
+        int frame_size = 0;
+        if ((err = hevc->annexb_demux(avs, &frame, &frame_size)) != srs_success) {
+            return srs_error_wrap(err, "demux hevc annexb");
+        }
+
+		if (frame == NULL || frame_size <= 0 ) {
+            continue;
+        }
+        
+        SrsHevcNaluType nal_unit_type = SrsHevcNaluTypeParse(frame[0]);
+
+		//printf("%d size:%5d\n", nal_unit_type, frame_size);
+
+        if (nal_unit_type == SrsHevcNaluType_ACCESS_UNIT_DELIMITER) {
+			if(i_frame < 15)
+			i_frame += b_data;
+			b_data = 0;
+            continue;
+        }
+        if (nal_unit_type == SrsHevcNaluType_SEI) {
+            continue;
+        }
+        // for vps
+        if (hevc->is_vps(frame, frame_size)) {
+            std::string vps;
+            if ((err = hevc->vps_demux(frame, frame_size, vps)) != srs_success) {
+                return srs_error_wrap(err, "demux vps");
+            }
+
+            if (!vps.empty() && hevc_vps_ != vps) {
+                vps_sps_pps_change_ = true;
+            }
+
+            hevc_vps_ = vps;
+            //h265_sps_pps_change_ = true;
+            continue;
+        }
+
+        // for sps
+        if (hevc->is_sps(frame, frame_size)) {
+            std::string sps;
+            if ((err = hevc->sps_demux(frame, frame_size, sps)) != srs_success) {
+                return srs_error_wrap(err, "demux sps");
+            }
+
+            if (! sps.empty() && hevc_sps_ != sps) {
+                vps_sps_pps_change_ = true;
+            }
+
+            hevc_sps_ = sps;
+            //h265_sps_pps_change_ = true;
+            continue;
+        }
+
+        // for pps
+        if (hevc->is_pps(frame, frame_size)) {
+            std::string pps;
+            if ((err = hevc->pps_demux(frame, frame_size, pps)) != srs_success) {
+                return srs_error_wrap(err, "demux pps");
+            }
+
+            if (! pps.empty() && hevc_pps_ != pps) {
+                vps_sps_pps_change_ = true;
+            }
+
+            hevc_pps_ = pps;
+            //h265_sps_pps_change_ = true;
+            continue;
+        }
+
+		b_data = 1;
+        ipb_frames[i_frame].push_back(make_pair(frame, frame_size));
+    }
+
+    if ((err = check_vps_sps_pps_change(msg)) != srs_success) {
+        return srs_error_wrap(err, "check vps sps pps");
+    }
+
+	int b = 0;
+	int i_bframe = 0;
+	i_frame += b_data;
+	for(int i = 0; i < i_frame; i++)
+	{
+		if(!i)
+		{
+			i_dts = msg->dts*100 / 9;
+			i_pts = msg->pts*100 / 9;
+			if(msg->pts != msg->dts)
+			{
+				if(i_last_dts > 0)
+				{
+					i_frame_period = i_dts - i_last_dts;
+					if(i_frame_period < 10000)
+					i_frame_period = 10000;
+					i_last_dts = 0;
+				}
+
+				i_bframe = (i_pts - i_dts + i_frame_period/2)/i_frame_period;
+				if(i_bframe > 2)
+					i_bframe = 2;
+				else if(i_bframe < 0)
+					i_bframe = 0;
+			}
+			else
+			{
+				i_last_dts = i_dts;
+			}
+		}
+		else
+		{
+			if(i_bframe == b)
+			{
+				i_dts += i_frame_period;
+				if(i_bframe > 0)
+					i_pts = i_dts + i_frame_period*i_bframe;
+				else
+					i_pts = i_dts;
+				b = 0;
+			}
+			else
+			{
+				i_pts  = i_dts;
+				i_dts += i_frame_period;
+				b++;
+			}
+		}
+
+#if 0
+		{
+			static int64_t dts = 0;
+			FILE *fp = fopen("/home/gmt/Documents/test.txt", dts > 0? "at":"wt");
+			fprintf(fp, "i:%d b:%d pd:%d dts:%ld d:%ld pts:%ld pts-dts:%ld\n",
+				i, b, i_frame_period, i_dts, i_dts - dts, i_pts, i_pts - i_dts);
+			fclose(fp);
+			dts = i_dts;
+		}
+#endif
+
+		msg->dts = i_dts*9/100;
+		msg->pts = i_pts*9/100;
+
+		if ((err = on_hevc_frame(msg, ipb_frames[i], SrsVideoCodecIdHEVC)) != srs_success) {
+			return srs_error_wrap(err, "on_video_frame");
+		}
+	}
+
+    return err;//on_video_frame(msg, ipb_frames, SrsVideoCodecIdHEVC);
+}
+srs_error_t SrsSrtFrameBuilder::check_vps_sps_pps_change(SrsTsMessage* msg)
+{
+    srs_error_t err = srs_success;
+
+    if (!vps_sps_pps_change_) {
+        return err;
+    }
+
+    if (hevc_vps_.empty() || hevc_sps_.empty() || hevc_pps_.empty()) {
+        return srs_error_new(ERROR_SRT_TO_RTMP_EMPTY_SPS_PPS, "vps or sps or pps empty");
+    }
+
+    // vps/sps/pps changed, generate new video sh frame and dispatch it.
+    vps_sps_pps_change_ = false;
+
+    // ts tbn to flv tbn.
+    uint32_t dts = (uint32_t)(msg->dts / 90);
+
+    std::string sh;
+    SrsRawHEVCStream* hevc = new SrsRawHEVCStream();
+    SrsAutoFree(SrsRawHEVCStream, hevc);
+
+    if ((err = hevc->mux_sequence_header(hevc_vps_, hevc_sps_, hevc_pps_, sh)) != srs_success) {
+        return srs_error_wrap(err, "mux sequence header");
+    }
+
+    // h265 packet to flv packet.
+    char* flv = NULL;
+    int nb_flv = 0;
+    if ((err = hevc->mux_avc2flv(sh, SrsVideoAvcFrameTypeKeyFrame, SrsVideoAvcFrameTraitSequenceHeader, dts, dts, &flv, &nb_flv)) != srs_success) {
+        return srs_error_wrap(err, "avc to flv");
+    }
+
+    SrsMessageHeader header;
+    header.initialize_video(nb_flv, dts, video_streamid_);
+    SrsCommonMessage rtmp;
+    if ((err = rtmp.create(&header, flv, nb_flv)) != srs_success) {
+        return srs_error_wrap(err, "create rtmp");
+    }
+
+    SrsSharedPtrMessage frame;
+    if ((err = frame.create(&rtmp)) != srs_success) {
+        return srs_error_wrap(err, "create frame");
+    }
+
+    if ((err = bridge_->on_frame(&frame)) != srs_success) {
+        return srs_error_wrap(err, "srt to rtmp vps/sps/pps");
+    }
+
+    return err;
+}
+
+srs_error_t SrsSrtFrameBuilder::on_hevc_frame(SrsTsMessage* msg, vector<pair<char*, int> >& ipb_frames)
+{
+    srs_error_t err = srs_success;
+
+    if (ipb_frames.empty()) {
+        return srs_error_new(ERROR_SRT_CONN, "empty frame");
+    }
+
+    bool is_keyframe = false;
+
+    // ts tbn to flv tbn.
+    uint32_t dts = (uint32_t)(msg->dts / 90);
+    uint32_t pts = (uint32_t)(msg->pts / 90);
+    int32_t cts = pts - dts;
+
+    // for IDR frame, the frame is keyframe.
+    SrsVideoAvcFrameType frame_type = SrsVideoAvcFrameTypeInterFrame;
+
+    // 5bytes video tag header
+    int frame_size = 5;
+    for (size_t i = 0; i != ipb_frames.size(); ++i) {
+        // 4 bytes for nalu length.
+        frame_size += 4 + ipb_frames[i].second;
+        SrsHevcNaluType nalu_type = SrsHevcNaluTypeParse(ipb_frames[i].first[0]);
+        if ((nalu_type >= SrsHevcNaluType_CODED_SLICE_BLA) && (nalu_type <= SrsHevcNaluType_RESERVED_23)) {
+            frame_type = SrsVideoAvcFrameTypeKeyFrame;
+        }
+    }
+
+    SrsCommonMessage rtmp;
+    rtmp.header.initialize_video(frame_size, dts, video_streamid_);
+    rtmp.create_payload(frame_size);
+    rtmp.size = frame_size;
+    SrsBuffer payload(rtmp.payload, rtmp.size);
+
+    // Write 5bytes video tag header.
+
+    // @see: E.4.3 Video Tags, video_file_format_spec_v10_1.pdf, page 78
+    // Frame Type, Type of video frame.
+    // CodecID, Codec Identifier.
+    // set the rtmp header
+    payload.write_1bytes((frame_type << 4) | SrsVideoCodecIdHEVC);
+    // hevc_type: nalu
+    payload.write_1bytes(0x01);
+    // composition time
+    payload.write_3bytes(cts);
+
+    // Write video nalus.
+    for (size_t i = 0; i != ipb_frames.size(); ++i) {
+        char* nal = ipb_frames[i].first;
+        int nal_size = ipb_frames[i].second;
+
+        // write 4 bytes of nalu length.
+        payload.write_4bytes(nal_size);
+        // write nalu
+        payload.write_bytes(nal, nal_size);
+    }
+
+    SrsSharedPtrMessage frame;
+    if ((err = frame.create(&rtmp)) != srs_success) {
+        return srs_error_wrap(err, "create frame");
+    }
+
+    if ((err = bridge_->on_frame(&frame)) != srs_success) {
+        return srs_error_wrap(err ,"srt ts hevc video to rtmp");
+    }
+
+    return err;
+}
 */
-srs_error_t SrsRtmpFromSrtBridge::on_ts_audio(SrsTsMessage* msg, SrsBuffer* avs)
+srs_error_t SrsSrtFrameBuilder::on_ts_audio(SrsTsMessage* msg, SrsBuffer* avs)
 {
     srs_error_t err = srs_success;
     
@@ -1049,7 +970,7 @@ srs_error_t SrsRtmpFromSrtBridge::on_ts_audio(SrsTsMessage* msg, SrsBuffer* avs)
     return err;
 }
 
-srs_error_t SrsRtmpFromSrtBridge::check_audio_sh_change(SrsTsMessage* msg, uint32_t pts)
+srs_error_t SrsSrtFrameBuilder::check_audio_sh_change(SrsTsMessage* msg, uint32_t pts)
 {
     srs_error_t err = srs_success;
     
@@ -1072,19 +993,24 @@ srs_error_t SrsRtmpFromSrtBridge::check_audio_sh_change(SrsTsMessage* msg, uint3
     stream.write_1bytes(aac_flag);
     stream.write_1bytes(0);
     stream.write_bytes((char*)audio_sh_.data(), audio_sh_.size());
+
+    SrsSharedPtrMessage frame;
+    if ((err = frame.create(&rtmp)) != srs_success) {
+        return srs_error_wrap(err, "create frame");
+    }
     
-    if ((err = live_source_->on_audio(&rtmp)) != srs_success) {
+    if ((err = bridge_->on_frame(&frame)) != srs_success) {
         return srs_error_wrap(err, "srt to rtmp audio sh");
     }
 
     return err;
 }
 
-srs_error_t SrsRtmpFromSrtBridge::on_aac_frame(SrsTsMessage* msg, uint32_t pts, char* frame, int frame_size)
+srs_error_t SrsSrtFrameBuilder::on_aac_frame(SrsTsMessage* msg, uint32_t pts, char* data, int data_size)
 {
     srs_error_t err = srs_success;
     
-    int rtmp_len = frame_size + 2/* 2 bytes of flv audio tag header*/;
+    int rtmp_len = data_size + 2/* 2 bytes of flv audio tag header*/;
 
     SrsCommonMessage rtmp;
     rtmp.header.initialize_audio(rtmp_len, pts, audio_streamid_);
@@ -1097,9 +1023,14 @@ srs_error_t SrsRtmpFromSrtBridge::on_aac_frame(SrsTsMessage* msg, uint32_t pts, 
     stream.write_1bytes(aac_flag);
     stream.write_1bytes(1);
     // Write audio frame.
-    stream.write_bytes(frame, frame_size);
+    stream.write_bytes(data, data_size);
+
+    SrsSharedPtrMessage frame;
+    if ((err = frame.create(&rtmp)) != srs_success) {
+        return srs_error_wrap(err, "create frame");
+    }
     
-    if ((err = live_source_->on_audio(&rtmp)) != srs_success) {
+    if ((err = bridge_->on_frame(&frame)) != srs_success) {
         return srs_error_wrap(err, "srt to rtmp audio sh");
     }
 
@@ -1110,6 +1041,7 @@ SrsSrtSource::SrsSrtSource()
 {
     req = NULL;
     can_publish_ = true;
+    frame_builder_ = NULL;
     bridge_ = NULL;
 }
 
@@ -1119,7 +1051,9 @@ SrsSrtSource::~SrsSrtSource()
     // for all consumers are auto free.
     consumers.clear();
 
+    srs_freep(frame_builder_);
     srs_freep(bridge_);
+    srs_freep(req);
 }
 
 srs_error_t SrsSrtSource::initialize(SrsRequest* r)
@@ -1169,10 +1103,13 @@ void SrsSrtSource::update_auth(SrsRequest* r)
     req->update_auth(r);
 }
 
-void SrsSrtSource::set_bridge(ISrsSrtSourceBridge* bridge)
+void SrsSrtSource::set_bridge(ISrsStreamBridge* bridge)
 {
     srs_freep(bridge_);
     bridge_ = bridge;
+
+    srs_freep(frame_builder_);
+    frame_builder_ = new SrsSrtFrameBuilder(bridge);
 }
 
 srs_error_t SrsSrtSource::create_consumer(SrsSrtConsumer*& consumer)
@@ -1219,8 +1156,18 @@ srs_error_t SrsSrtSource::on_publish()
         return srs_error_wrap(err, "source id change");
     }
 
+    if (bridge_) {
+        if ((err = frame_builder_->initialize(req)) != srs_success) {
+            return srs_error_wrap(err, "frame builder initialize");
+        }
+
+        if ((err = frame_builder_->on_publish()) != srs_success) {
+            return srs_error_wrap(err, "frame builder on publish");
+        }
+
     if ((err = bridge_->on_publish()) != srs_success) {
         return srs_error_wrap(err, "bridge on publish");
+        }
     }
 
     SrsStatistic* stat = SrsStatistic::instance();
@@ -1238,8 +1185,13 @@ void SrsSrtSource::on_unpublish()
 
     can_publish_ = true;
 
+    if (bridge_) {
+        frame_builder_->on_unpublish();
+        srs_freep(frame_builder_);
+
     bridge_->on_unpublish();
     srs_freep(bridge_);
+    }
 }
 
 srs_error_t SrsSrtSource::on_packet(SrsSrtPacket* packet)
@@ -1253,7 +1205,7 @@ srs_error_t SrsSrtSource::on_packet(SrsSrtPacket* packet)
         }
     }
 
-    if ((err = bridge_->on_packet(packet)) != srs_success) {
+    if (frame_builder_ && (err = frame_builder_->on_packet(packet)) != srs_success) {
         return srs_error_wrap(err, "bridge consume message");
     }
 
